@@ -1,0 +1,337 @@
+#!/bin/sh
+set -eu
+
+# Copyright (C) 2024 Jamie Nguyen <j@jamielinux.com>
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+
+VERSION=1.0.0
+
+# The URL where all metadata and OS images can be found.
+BASE_URL="https://builds.coreos.fedoraproject.org"
+
+# The URL for Fedora's GPG keyring.
+GPG_URL="https://fedoraproject.org/fedora.gpg"
+
+# https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+
+# The folder to store downloaded files.
+CACHE="${GET_COREOS_CACHE:-$XDG_CACHE_HOME/get-fedora-coreos}"
+
+# https://no-color.org/
+NO_COLOR="${NO_COLOR:-}"
+
+
+# Fedora CoreOS publishes one main metadata file for each available stream:
+# `stable.json`, `testing.json` and `next.json`. They have this structure:
+#
+# {
+#   "architectures": {
+#     "aarch64": {
+#       "artifacts": {
+#         "metal": {
+#           "formats": {
+#             "iso": { ... }
+#             "pxe": { ... }
+#             ...
+#         "openstack": {
+#           "formats": {
+#             "qcow2.xz": { ... }
+#             ...
+#     "x86_64": {
+#       "artifacts": {
+#         "qemu": {
+#           "formats": {
+#             "qcow2.xz": { ... }
+#             ...
+
+
+# Each set of images for a particular combination of stream, version and
+# architecture has a `meta.json` with this structure:
+#
+# {
+#   "ref": "fedora/x86_64/coreos/stable",
+#   "ostree-version": "39.20240322.3.1",
+#   "images": {
+#     "qemu": {
+#       "sha256": "86083b3..."
+#       "uncompressed-sha256": "96c1b02..."
+#     "openstack": {
+#       "sha256": "f2bb168..."
+#       "uncompressed-sha256": "897cae4..."
+#       ...
+
+
+# Functions
+# ---------
+
+usage() {
+    cat << EOF
+get-fedora-coreos $VERSION
+
+Usage: get-fedora-coreos list-available [STREAM]
+   or: get-fedora-coreos check-latest [STREAM]
+   or: get-fedora-coreos download STREAM VERSION ARCHITECTURE IMAGE_TYPE IMAGE_FORMAT
+   or: get-fedora-coreos list-downloads
+
+EXAMPLES
+
+  To see the latest available VERSION:
+  $ get-fedora-coreos check-latest
+  $ get-fedora-coreos check-latest testing
+  $ get-fedora-coreos check-latest next
+
+  To see available values for ARCHITECTURE, IMAGE_TYPE and IMAGE_FORMAT:
+  $ get-fedora-coreos list-available
+  $ get-fedora-coreos list-available testing
+  $ get-fedora-coreos list-available next
+
+  To download the latest VERSION:
+  $ get-fedora-coreos download stable latest x86_64 qemu qcow2.xz
+
+  To download a specific VERSION:
+  $ get-fedora-coreos download stable 39.20240322.3.1 x86_64 qemu qcow2.xz
+
+ENVIRONMENT
+
+  \$GET_COREOS_CACHE
+    The directory where downloaded files will be stored.
+    Default: \$XDG_CACHE_HOME/get-fedora-coreos
+
+  \$NO_COLOR
+    If this is set to a non-empty value, output won't be colorized.
+
+EOF
+    exit 0
+}
+
+curl_cmd() {
+    curl --proto =https --tlsv1.2 -Lf --progress-bar "$@"
+}
+
+list_available() {
+    _url="${BASE_URL}/streams/${1}.json"
+    _tmp="$(mktemp)"
+
+    curl_cmd -sS "$_url" -o "$_tmp"
+    _architectures="$(jq -r '.architectures | keys[]' "$_tmp")"
+    [ -z "$_architectures" ] && exit 1
+
+    printf '%s\n' "$_architectures" | while IFS= read -r _arch; do
+        _artifacts="$(jq -r --arg _arch "$_arch" '.architectures[$_arch].artifacts | keys[]' "$_tmp")"
+        [ -z "$_artifacts" ] && exit 1
+
+        printf '%s\n' "$_artifacts" | while IFS= read -r _image_type; do
+            _formats="$(jq -r --arg _arch "$_arch" --arg _image_type "$_image_type" '.architectures[$_arch].artifacts[$_image_type].formats | keys[]' "$_tmp")"
+            [ -z "$_formats" ] && exit 1
+
+            printf '%s\n' "$_formats" | while IFS= read -r _image_format; do
+                printf '%s\n' "$_arch $_image_type $_image_format"
+            done
+        done
+    done
+
+    rm -f "$_tmp"
+    exit 0
+}
+
+list_downloads() {
+    [ ! -d "$CACHE" ] && exit 0
+    find "$CACHE" -mindepth 5 -maxdepth 5 -type f \
+        ! -name '*-CHECKSUM' ! -name '*.sig' ! -name '*.gpg' \
+        ! -name '*.json' ! -name 'sha256*' ! -name '.*' | sort
+    exit 0
+}
+
+check_latest() {
+    _url="${BASE_URL}/streams/${1}.json"
+    _tmp="$(mktemp)"
+    curl_cmd -sS "$_url" -o "$_tmp"
+    jq -r '.architectures["x86_64"].artifacts["qemu"].release' "$_tmp"
+    rm -f "$_tmp"
+    exit 0
+}
+
+msg() {
+    _message="==> $1"
+    [ -z "$NO_COLOR" ] && _message="$(tput setaf 2)${_message}$(tput sgr0)"
+    printf '%s\n' "$_message"
+}
+
+error() {
+    _message="ERROR: $1"
+    [ -z "$NO_COLOR" ] && _message="$(tput setaf 1)${_message}$(tput sgr0)"
+    printf '%s\n' "$_message"
+    exit 1
+}
+
+download() {
+    _url="$1"
+    _out="$2"
+    [ -f "$_out" ] && return 0
+    msg "Downloading $_out"
+    curl_cmd "$_url" -o "$_out"
+    [ -f "$_out" ] || error "Failed to download '$_url'."
+    [ -s "$_out" ] || error "'$_out' is a zero-byte file."
+}
+
+
+# Eagerly handle '-h' and '--help'.
+# ---------------------------------
+
+if [ $# -eq 0 ] || [ "$1" = '-h' ] || [ "$1" = '--help' ]; then
+    usage
+fi
+
+
+# Check our dependencies are available.
+# -------------------------------------
+
+for cmd in curl gpgv jq sha256sum; do
+    if ! command -v $cmd >/dev/null 2>&1; then
+        error "Make sure '$cmd' is available in your PATH."
+    fi
+done
+
+
+# Handle command-line arguments.
+# ------------------------------
+
+case "$1" in
+    'list-available')
+        if [ $# -eq 2 ]; then
+            case "$2" in
+                'stable'|'testing'|'next')
+                    list_available "$2"
+                    ;;
+                *)
+                    usage
+                    ;;
+            esac
+        fi
+        list_available stable
+        ;;
+    'check-latest')
+        if [ $# -eq 2 ]; then
+            case "$2" in
+                'stable'|'testing'|'next')
+                    check_latest "$2"
+                    ;;
+                *)
+                    usage
+                    ;;
+            esac
+        fi
+        check_latest stable
+        ;;
+    'download')
+        shift 1
+        ;;
+    'list-downloads')
+        list_downloads
+        ;;
+    *)
+        usage
+        ;;
+esac
+
+[ $# -ne 5 ] && usage
+
+stream="$1"
+version="$2"
+arch="$3"
+image_type="$4"
+image_format="$5"
+
+if [ "$stream" != 'stable' ] && [ "$stream" != 'testing' ] && [ "$stream" != 'next' ]; then
+    usage
+fi
+
+if [ "$version" = 'latest' ]; then
+    version="$(check_latest "$stream")"
+    msg "Latest version is: $version"
+fi
+
+
+# Navigate into our output directory.
+# -----------------------------------
+
+dir="${CACHE}/${stream}/${version}/${arch}/${image_type}"
+[ -d "$dir" ] || mkdir -p "$dir"
+cd "$dir"
+
+
+# Set helpful variables.
+# ----------------------
+
+builds_url="${BASE_URL}/prod/streams/${stream}/builds/${version}/${arch}"
+src="fedora-coreos-${version}-${image_type}.${arch}.${image_format}"
+src_url="${builds_url}/${src}"
+sig="${src}.sig"
+sig_url="${builds_url}/${sig}"
+meta="meta.json"
+meta_url="${builds_url}/${meta}"
+gpg="fedora.gpg"
+
+checksum_file="${src}-CHECKSUM"
+sha256="sha256"
+sha256_uncompressed="sha256-uncompressed"
+
+
+# Download source files.
+# ----------------------
+
+if [ -f "$meta" ] && [ -f "$src" ] && [ -f "$sig" ] && [ -f "$gpg" ]; then
+    printf '\n'
+else
+    download "$meta_url" "$meta"
+    download "$src_url" "$src"
+    download "$sig_url" "$sig"
+    download "$GPG_URL" "$gpg"
+fi
+
+# Validate checksum and signature.
+# --------------------------------
+
+image_sha256="$(jq -r ".images.${image_type}.sha256" "$meta")"
+
+if [ ! -f "$checksum_file" ]; then
+    printf '%s\n' "SHA256 ($src) = $image_sha256" > "$checksum_file"
+fi
+
+msg "Validating checksum"
+if ! sha256sum -c "$checksum_file"; then
+    error "The checksum for '$src' is invalid. Delete '$dir' and re-download."
+fi
+printf '\n'
+
+msg "Validating GPG signature"
+if ! gpgv --keyring "./$gpg" "$sig" "$src"; then
+    error "The signature for '$src' is invalid. Delete '$dir' and re-download."
+fi
+printf '\n'
+
+
+# Finish.
+# -------
+
+if [ ! -f "$sha256" ]; then
+    msg "Writing sha256 file"
+    printf '%s\n' "$image_sha256" > "$sha256"
+fi
+
+if [ ! -f "$sha256_uncompressed" ]; then
+    has_uncompressed="$(jq -r ".images.${image_type} | has(\"uncompressed-sha256\")" "$meta")"
+    if [ "$has_uncompressed" = 'true' ]; then
+        msg "Writing sha256-uncompressed file"
+        image_sha256_uncompressed="$(jq -r ".images.${image_type}.\"uncompressed-sha256\"" "$meta")"
+        printf '%s\n' "$image_sha256_uncompressed" > "$sha256_uncompressed"
+    fi
+fi
+
+msg "Success! Your Fedora CoreOS image is available here:"
+printf '%s\n' "${dir}/${src}"
